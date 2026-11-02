@@ -327,16 +327,89 @@ function toggleFavorite() {
 }
 
 /* ---------------------------------------------------------------- keys */
+/* Tizen 4.0 quirk: setting currentTime updates the property but the engine may
+   ignore the actual stream seek (it never requests the target byte range and
+   playback keeps its own position — ct reads back EXACTLY the set value).
+   seekBy tries three strategies in order, logging each result:
+     A. plain currentTime set (works on some files)
+     B. pause -> seek -> resume
+     C. media-fragment restart: re-open the stream at #t=<seconds>
+   "ignored" is detected by time: after a real seek, ct advances (~+1s); if ct
+   still reads exactly the target after 900ms, the engine didn't move. */
+function seekIsStuck(v, t) {
+  return Math.abs(v.currentTime - t) < 0.15;   // frozen exactly at target
+}
+
 function seekBy(sec) {
   var v = $('player');
-  if (!v.duration || g.seekBusy) return;
+  if (g.seekBusy) return;
   g.seekBusy = true;
-  var t = v.currentTime + sec;
+  var it = g.items ? g.items[g.idx] : null;
+  var url = g.server + '/api/video?p=' + encodeURIComponent(it ? it.path : '');
+  var dur = v.duration;
+  var end = (dur && isFinite(dur)) ? dur - 1 : null;
+  try {
+    if (!end && v.seekable && v.seekable.length) {
+      end = v.seekable.end(v.seekable.length - 1) - 1;
+    }
+  } catch (e0) {}
+  var from = v.currentTime;
+  var t = from + sec;
   if (t < 0) t = 0;
-  if (t > v.duration - 1) t = v.duration - 1;
-  v.currentTime = t;
-  showHud();
-  setTimeout(function () { g.seekBusy = false; }, 250);
+  if (end !== null && t > end) t = end;
+  var wasPlaying = !v.paused;
+  tvlog('seek req ' + sec + 's ' + from.toFixed(1) + ' -> ' + t.toFixed(1) +
+        ' (dur=' + dur + ')');
+  // Keep the HUD hidden during seeks (Nathan wants a clear view of the
+  // progress bar jumping) — a small status line carries the feedback.
+  var mk = Math.floor(Math.abs(t) / 60), sk = Math.floor(Math.abs(t) % 60);
+  status((sec > 0 ? '\u25B6\u25B6 +' : '\u25C0\u25C0 \u2212') + Math.abs(sec) +
+         's \u2192 ' + mk + ':' + (sk < 10 ? '0' : '') + sk, 1800);
+
+  function attemptB() {
+    tvlog('seek B: pause-seek-resume');
+    try { v.pause(); } catch (e) {}
+    try { v.currentTime = t; } catch (e1) {}
+    setTimeout(function () {
+      try { if (wasPlaying) v.play(); } catch (e2) {}
+      setTimeout(function () {
+        tvlog('seek B result ct=' + v.currentTime.toFixed(1) +
+              (seekIsStuck(v, t) ? ' STUCK' : ' moved'));
+        if (seekIsStuck(v, t)) attemptC();
+        else finish(true);
+      }, 900);
+    }, 500);
+  }
+
+  function attemptC() {
+    tvlog('seek C: fragment restart #t=' + t.toFixed(1));
+    v.src = url + '#t=' + t.toFixed(1);
+    try { if (wasPlaying) v.play(); } catch (e3) {}
+    setTimeout(function () {
+      tvlog('seek C result ct=' + (v.currentTime || 0).toFixed(1) +
+            ' readyState=' + v.readyState);
+      finish(true);
+    }, 1500);
+  }
+
+  function finish(ok) {
+    g.seekBusy = false;
+    // no showHud(): a seek should not re-summon the info overlay
+  }
+
+  // Attempt A
+  try { v.currentTime = t; } catch (err) {
+    tvlog('seek A threw ' + err);
+    attemptB();
+    return;
+  }
+  setTimeout(function () {
+    var moved = !seekIsStuck(v, t);
+    tvlog('seek A result ct=' + v.currentTime.toFixed(1) + (moved ? ' moved' : ' STUCK'));
+    if (moved) finish(true);
+    else if (wasPlaying) attemptB();
+    else attemptC();   // paused video: ct frozen is normal while paused — go straight to C
+  }, 900);
 }
 
 function togglePause() {
@@ -363,8 +436,9 @@ function exitApp() {
 
 /* ---------------------------------------------------------------- menu */
 var MENU_ACTIONS = [
-  { label: '\u25B6\u25B6 Next video', act: function () { closeMenu(); next(); } },
   { label: '\u25C0\u25C0 Previous video', act: function () { closeMenu(); prev(); } },
+  { label: '\u23F8 Pause / \u25B6 Play', act: function () { closeMenu(); togglePause(); } },
+  { label: '\u25B6\u25B6 Next video', act: function () { closeMenu(); next(); } },
   { label: '\u21BB Restart video', act: function () {
       closeMenu();
       try { $('player').currentTime = 0; status('\u21BB Restarted', 1500); showHud(); } catch (e2) {}
@@ -373,15 +447,14 @@ var MENU_ACTIONS = [
   { label: '\u2715 Exit app', act: function () { closeMenu(); exitApp(); } }
 ];
 
-var menuSel = 0;
+var menuSel = 1;   // default: Pause/Play (center of Previous|Pause|Next)
 
 function openMenu() {
-  try { $('player').pause(); } catch (e) {}
-  menuSel = 0;
+  menuSel = 1;
   renderMenu();
   $('menu-title').innerHTML = current() ? current().title : '';
   $('menu').className = '';
-  tvlog('menu open');
+  tvlog('menu open (playing=' + !$('player').paused + ')');
 }
 
 function renderMenu() {
@@ -394,7 +467,7 @@ function renderMenu() {
 
 function closeMenu() {
   $('menu').className = 'hidden';
-  try { $('player').play(); } catch (e) {}
+  // no auto-play: the menu never paused the video (Nathan's preference)
 }
 
 function menuOpen() { return $('menu').className !== 'hidden'; }
@@ -542,6 +615,12 @@ function wireVideo() {
       tvlog('stalled ct=' + (v.currentTime || 0));
     }
   });
+  v.addEventListener('seeking', function () {
+    tvlog('seeking -> ' + (v.currentTime || 0).toFixed(1));
+  });
+  v.addEventListener('seeked', function () {
+    tvlog('seeked -> ' + (v.currentTime || 0).toFixed(1));
+  });
 }
 
 /* ---------------------------------------------------------------- go */
@@ -549,5 +628,5 @@ document.onkeydown = onKeyDown;
 if (window.addEventListener) window.addEventListener('tizenhwkey', onTizenHwKey, false);
 wireVideo();
 setInterval(updateProgress, 500);   // progress bar + time readout
-tvlog('boot v1.0.14 ua=' + (navigator.userAgent || '').slice(-60));
+tvlog('boot v1.0.20 ua=' + (navigator.userAgent || '').slice(-60));
 boot();
