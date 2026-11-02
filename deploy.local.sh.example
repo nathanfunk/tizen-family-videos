@@ -1,6 +1,10 @@
-# Copy to deploy.local.sh (gitignored) and fill in:
+# Copy to deploy.local.sh (gitignored), fill it in, then: chmod 600 deploy.local.sh
 # export FV_AUTHOR_PW='<your Tizen author cert password>'
 # export FV_TV_TOKEN='<Samsung WS API token (also in ~/.config/samsungctl.conf)>'
 # export FV_TV_HOST='<TV IP>'
 # export FV_APP_ID='<appId>.<package> as installed on the TV'
 # export FV_TVCTL=/path/to/samsungtv-cli   # optional
+# export FV_ICON=/path/to/your-icon.png    # optional personal launcher icon
+#   (any image works; ship it wide, e.g. 768x432 16:9, to get a wide tile)
+# export TIZEN_HOME="$HOME/tizen-studio"        # optional SDK location
+# export TIZEN_DATA="$HOME/tizen-studio-data"   # optional SDK data location

@@ -7,7 +7,7 @@
  * progress is visible server-side; all errors also show on screen.
  */
 
-var SERVERS = ['http://rpi:8123', 'http://10.0.0.172:8123', 'http://10.0.0.175:8123'];
+var SERVERS = ['http://rpi:8123'];   // add your Pi's LAN IP(s) here if mDNS isn't available
 
 var g = {
   server: '',          // winning base URL
@@ -20,10 +20,24 @@ var g = {
   bootT: 0,            // Date.now() at boot
   playSeen: false,     // first 'playing' event since last src change
   watchdog: null,
+  skipTimer: null,
+  pendingNext: false,
+  pendingLaunch: null,
+  loadToken: 0,
   lastStallLog: 0
 };
 
 function $(id) { return document.getElementById(id); }
+
+function esc(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function safeDecode(value) {
+  try { return decodeURIComponent(value); } catch (e) { return value; }
+}
 
 /* ---------------------------------------------------------------- logging */
 // NOTE: text/plain body keeps these "simple" CORS requests (no preflight),
@@ -77,6 +91,79 @@ function boot() {
   tryServer(0);
 }
 
+/* ------------------------------------------------- Smart Hub Preview deep link */
+/* Launcher preview tiles launch (or poke) the app with the tile's action_data
+   as an ApplicationControlData under the PAYLOAD key. We send it as a JSON
+   string: {"path": "<index-relative-path>"}. */
+function readDeepLink() {
+  try {
+    if (!window.tizen || !tizen.application) return null;
+    var ctrl = tizen.application.getCurrentApplication().getRequestedAppControl();
+    if (!ctrl) return null;
+    // correct Tizen shape: ctrl.appControl.data (getAppControlData() is not
+    // part of the API — it always returned null)
+    var data = (ctrl.appControl && ctrl.appControl.data) || [];
+    for (var i = 0; i < data.length; i++) {
+      if (data[i] && data[i].key === 'PAYLOAD' && data[i].value && data[i].value.length) {
+        var raw = data[i].value[0];
+        // the launcher wraps payloads: {"values": "<url-encoded json>"}
+        // (per the Samsung sample: JSON.parse(value[0]).values, then parse)
+        try {
+          var wrap = JSON.parse(raw);
+          if (wrap && typeof wrap.values === 'string') {
+            raw = safeDecode(wrap.values);
+          }
+        } catch (e1) { /* payload was already plain JSON */ }
+        return raw;
+      }
+    }
+  } catch (e) {
+    tvlog('deeplink read error ' + e);
+  }
+  return null;
+}
+
+function deepPlay(payload) {
+  var path = null;
+  if (payload && typeof payload === 'object') {
+    if (payload.path) path = payload.path;
+  } else {
+    try {
+      var p = JSON.parse(payload);
+      if (p && p.path) path = p.path;
+    } catch (e1) {
+      if (typeof payload === 'string' && payload.indexOf('/') >= 0) {
+        path = payload;   // raw path fallback
+      }
+    }
+  }
+  if (!path) return false;
+  path = String(path);
+  tvlog('deep link play: ' + path);
+  abortLoads();   // a boot/queue fetch must not overwrite this single-item queue
+  g.items = [{ path: path, title: path.split('/').pop() || 'Video' }];
+  g.idx = 0;
+  play(0, true);
+  return true;
+}
+
+function handleLaunchPayload() {
+  var payload = readDeepLink();
+  if (!payload) return false;
+  return deepPlay(payload);
+}
+
+/* While the app is already running, an appcontrol event carries the same
+   payload (only fires when relaunch is disabled in config.xml). */
+function onAppControl() {
+  try {
+    var payload = readDeepLink();
+    if (!payload) return;
+    if (!g.server) { g.pendingLaunch = payload; return; }   // still booting
+    deepPlay(payload);
+  } catch (e) { tvlog('appcontrol event error ' + e); }
+}
+
 function tryServer(i) {
   if (i >= SERVERS.length) {
     $('boot-status').innerHTML = 'No video server found on the network.<br>Check that the Pi is up.';
@@ -88,6 +175,13 @@ function tryServer(i) {
     if (status === 200) {
       g.server = base;
       tvlogAt(base, 'boot: server ok ' + base + ' (' + (Date.now() - g.bootT) + 'ms)');
+      // Launcher preview tile click: play THAT video instead of the shuffle
+      if (g.pendingLaunch) {
+        var pending = g.pendingLaunch;
+        g.pendingLaunch = null;
+        if (deepPlay(pending)) return;
+      }
+      if (handleLaunchPayload()) return;
       loadPlaylist();
     } else {
       tvlogAt(SERVERS[0], 'boot: server ' + base + ' failed status=' + status);
@@ -96,10 +190,17 @@ function tryServer(i) {
   });
 }
 
+function abortLoads() {
+  g.loadToken++;
+  extending = false;
+}
+
 function loadPlaylist() {
   $('boot-status').innerHTML = 'Loading videos&hellip;';
   var t0 = Date.now();
+  var token = ++g.loadToken;
   xhrGet(g.server + '/api/playlist?mode=random&n=25', 15000, function (status, text) {
+    if (token !== g.loadToken) return;   // superseded by a deep link / refresh
     if (status !== 200) {
       $('boot-status').innerHTML = 'Could not load the video list (server error ' + status + ').';
       tvlog('boot: playlist failed status=' + status);
@@ -129,6 +230,10 @@ function play(i, fromBoot) {
   var it = current();
   var v = $('player');
   g.playSeen = false;
+  g.pendingNext = false;
+  g.lastStallLog = 0;
+  lastPct = -1;
+  if (g.skipTimer) { clearTimeout(g.skipTimer); g.skipTimer = null; }
   if (g.watchdog) clearTimeout(g.watchdog);
   // Watchdog: if the media element never starts, report it server-side
   g.watchdog = setTimeout(function () {
@@ -178,6 +283,7 @@ function next() {
     play(g.idx + 1);
     extendQueueSoon();
   } else if (extending) {
+    g.pendingNext = true;   // auto-advance when the in-flight batch lands
     status('Loading more videos\u2026', 4000);
   } else {
     // queue fully consumed: refresh and keep playing
@@ -200,12 +306,26 @@ function extendQueue() {
   if (extending) return;
   extending = true;
   var t0 = Date.now();
+  var token = ++g.loadToken;
   xhrGet(g.server + '/api/playlist?mode=random&n=25', 15000, function (st, text) {
+    if (token !== g.loadToken) return;   // superseded by a deep link / refresh
     extending = false;
-    if (st !== 200 || !text) return;
+    if (st !== 200 || !text) {
+      if (g.pendingNext) {
+        g.pendingNext = false;
+        status('Could not load more videos', 4000);
+      }
+      return;
+    }
     var data = null;
     try { data = JSON.parse(text); } catch (e) { data = null; }
-    if (!data || !data.items) return;
+    if (!data || !data.items) {
+      if (g.pendingNext) {
+        g.pendingNext = false;
+        status('Could not load more videos', 4000);
+      }
+      return;
+    }
     var seen = {};
     for (var i = 0; i < g.items.length; i++) seen[g.items[i].path] = 1;
     var added = 0;
@@ -217,12 +337,18 @@ function extendQueue() {
       tvlog('queue extended +' + added + ' (total ' + g.items.length + ') (' + (Date.now() - t0) + 'ms)');
       prefetchMeta(g.items.length - added);   // warm meta for the new batch
     }
+    if (g.pendingNext) {
+      if (g.idx + 1 < g.items.length) play(g.idx + 1);
+      else { g.pendingNext = false; refreshQueue(); }
+    }
   });
 }
 
 function refreshQueue() {
   extending = true;
+  var token = ++g.loadToken;
   xhrGet(g.server + '/api/playlist?mode=random&n=25', 15000, function (st, text) {
+    if (token !== g.loadToken) return;   // superseded by a deep link / newer fetch
     extending = false;
     if (st !== 200 || !text) { status('Could not load more videos', 4000); return; }
     var data = null;
@@ -245,9 +371,9 @@ function prev() {
  * the geocoder/server aren't flooded. Cached server-side, so repeat boots are
  * instant; a fresh clip's location is ready before it ever plays. */
 function prefetchMeta(i) {
+  while (i < g.items.length && g.items[i].metaDone) i++;
   if (i >= g.items.length) return;
   var it = g.items[i];
-  if (it.metaDone) { prefetchMeta(i + 1); return; }
   it.metaDone = true;
   var t0 = Date.now();
   xhrGet(g.server + '/api/meta?p=' + encodeURIComponent(it.path), 30000, function (st, text) {
@@ -274,13 +400,14 @@ function prefetchMeta(i) {
 /* ---------------------------------------------------------------- HUD */
 function updateMetaLine() {
   var it = current();
-  if (!it) return;
-  var txt = it.date || '';
-  if (it.location) txt += (txt ? ' \u2014 ' : '') + it.location;
-  if (it.kids) txt += (txt ? ' \u2014 ' : '') + it.kids;
-  if (it.note) txt += (txt ? '<br>' : '') + '\u201C' + it.note + '\u201D';
-  if (txt) { $('meta-line').innerHTML = txt; $('meta-line').className = ''; }
-  else { $('meta-line').className = 'hidden'; }
+  var el = $('meta-line');
+  if (!el || !it) { if (el) el.className = 'hidden'; return; }
+  var txt = esc(it.date || '');
+  if (it.location) txt += (txt ? ' \u2014 ' : '') + esc(it.location);
+  if (it.kids) txt += (txt ? ' \u2014 ' : '') + esc(it.kids);
+  if (it.note) txt += (txt ? '<br>' : '') + '\u201C' + esc(it.note) + '\u201D';
+  if (txt) { el.innerHTML = txt; el.className = ''; }
+  else { el.className = 'hidden'; }
 }
 
 function showHud() {
@@ -288,10 +415,10 @@ function showHud() {
   if (!it) return;
   updateMetaLine();
   $('hud-pos').innerHTML = (g.idx + 1) + ' / ' + g.items.length;
-  $('hud-title').innerHTML = it.title;
+  $('hud-title').innerHTML = esc(it.title);
   var meta = it.date || '';
   if (it.location) meta += (meta ? ' \u2014 ' : '') + it.location;
-  $('hud-meta').innerHTML = meta;
+  $('hud-meta').innerHTML = esc(meta);
   $('hud-star').className = it.favorite ? '' : 'hidden';
   $('hud').className = '';
   if (g.hudTimer) clearTimeout(g.hudTimer);
@@ -343,9 +470,10 @@ function seekIsStuck(v, t) {
 function seekBy(sec) {
   var v = $('player');
   if (g.seekBusy) return;
-  g.seekBusy = true;
   var it = g.items ? g.items[g.idx] : null;
-  var url = g.server + '/api/video?p=' + encodeURIComponent(it ? it.path : '');
+  if (!it) return;
+  g.seekBusy = true;
+  var url = g.server + '/api/video?p=' + encodeURIComponent(it.path);
   var dur = v.duration;
   var end = (dur && isFinite(dur)) ? dur - 1 : null;
   try {
@@ -436,15 +564,16 @@ function exitApp() {
 
 /* ---------------------------------------------------------------- menu */
 var MENU_ACTIONS = [
-  { label: '\u25C0\u25C0 Previous video', act: function () { closeMenu(); prev(); } },
-  { label: '\u23F8 Pause / \u25B6 Play', act: function () { closeMenu(); togglePause(); } },
-  { label: '\u25B6\u25B6 Next video', act: function () { closeMenu(); next(); } },
+  { label: '\u25C0\u25C0 Previous', act: function () { closeMenu(); prev(); } },
+  // button text follows playback state: shows the action the key WILL take
+  { label: function () { return $('player').paused ? '\u25B6 Play' : '\u23F8 Pause'; },
+    act: function () { closeMenu(); togglePause(); } },
+  { label: '\u25B6\u25B6 Next', act: function () { closeMenu(); next(); } },
   { label: '\u21BB Restart video', act: function () {
       closeMenu();
       try { $('player').currentTime = 0; status('\u21BB Restarted', 1500); showHud(); } catch (e2) {}
   } },
-  { label: '\u2605 Favorite', act: function () { closeMenu(); toggleFavorite(); } },
-  { label: '\u2715 Exit app', act: function () { closeMenu(); exitApp(); } }
+  { label: '\u2605 Favorite', act: function () { closeMenu(); toggleFavorite(); } }
 ];
 
 var menuSel = 1;   // default: Pause/Play (center of Previous|Pause|Next)
@@ -452,7 +581,7 @@ var menuSel = 1;   // default: Pause/Play (center of Previous|Pause|Next)
 function openMenu() {
   menuSel = 1;
   renderMenu();
-  $('menu-title').innerHTML = current() ? current().title : '';
+  $('menu-title').innerHTML = current() ? esc(current().title) : '';
   $('menu').className = '';
   tvlog('menu open (playing=' + !$('player').paused + ')');
 }
@@ -460,7 +589,9 @@ function openMenu() {
 function renderMenu() {
   var html = '';
   for (var i = 0; i < MENU_ACTIONS.length; i++) {
-    html += '<div class="menu-item' + (i === menuSel ? ' sel' : '') + '">' + MENU_ACTIONS[i].label + '</div>';
+    var label = MENU_ACTIONS[i].label;
+    if (typeof label === 'function') label = label();   // state-aware (Pause/Play)
+    html += '<div class="menu-item' + (i === menuSel ? ' sel' : '') + '">' + esc(label) + '</div>';
   }
   $('menu-items').innerHTML = html;
 }
@@ -594,6 +725,10 @@ function wireVideo() {
     tvlog('playing t=+' + (Date.now() - g.bootT) + 'ms ct=' + (v.currentTime || 0));
   });
   v.addEventListener('ended', function () { tvlog('ended idx=' + g.idx); next(); });
+  // keep the open menu's Pause/Play label honest if state changes underneath
+  function menuRefresh() { if (menuOpen()) renderMenu(); }
+  v.addEventListener('play', menuRefresh);
+  v.addEventListener('pause', menuRefresh);
   v.addEventListener('waiting', function () {
     var now = Date.now();
     if (now - g.lastStallLog > 5000) {
@@ -606,7 +741,8 @@ function wireVideo() {
     var code = v.error ? (v.error.code + '/' + (v.error.message || '')) : 'null';
     tvlog('video ERROR ' + code + ' src=' + (v.currentSrc || v.src));
     status('Cannot play this file (' + (v.error ? v.error.code : '?') + ') — skipping\u2026', 4000);
-    setTimeout(next, 2500);
+    if (g.skipTimer) clearTimeout(g.skipTimer);
+    g.skipTimer = setTimeout(function () { g.skipTimer = null; next(); }, 2500);
   });
   v.addEventListener('stalled', function () {
     var now = Date.now();
@@ -625,8 +761,11 @@ function wireVideo() {
 
 /* ---------------------------------------------------------------- go */
 document.onkeydown = onKeyDown;
-if (window.addEventListener) window.addEventListener('tizenhwkey', onTizenHwKey, false);
+if (window.addEventListener) {
+  window.addEventListener('tizenhwkey', onTizenHwKey, false);
+  window.addEventListener('appcontrol', onAppControl, false);   // preview tiles while running
+}
 wireVideo();
 setInterval(updateProgress, 500);   // progress bar + time readout
-tvlog('boot v1.0.20 ua=' + (navigator.userAgent || '').slice(-60));
+tvlog('boot v1.0.29 ua=' + (navigator.userAgent || '').slice(-60));
 boot();

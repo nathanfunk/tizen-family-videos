@@ -126,15 +126,17 @@ html, body {
   color: #9ad8ff;
   margin-bottom: 0.7vh;
 }
-#menu-items { display: flex; gap: 1.2vw; }
+#menu-items { display: flex; }
 .menu-item {
   font-size: 3.2vh;
   color: #cfd8e3;
   background: rgba(255, 255, 255, 0.08);
   padding: 1.2vh 2.2vw;
+  margin-right: 1.2vw;   /* flex gap is unsupported on Tizen 4's WebKit */
   border-radius: 0.6vh;
   border: 0.25vh solid transparent;
 }
+.menu-item:last-child { margin-right: 0; }
 .menu-item.sel {
   color: #fff;
   border-color: #ffd34d;
