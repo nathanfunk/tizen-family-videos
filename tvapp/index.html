@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920, height=1080, initial-scale=1">
+  <title>Family Videos</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="boot-screen">
+    <div class="boot-title">Family Videos</div>
+    <div id="boot-status">Looking for the video server&hellip;</div>
+  </div>
+
+  <video id="player" playsinline preload="auto"></video>
+
+  <div id="progress"><div id="progress-fill"></div><div id="progress-time" class="hidden"></div></div>
+
+  <div id="meta-line" class="hidden"></div>
+
+  <div id="hud" class="hidden">
+    <div id="hud-star" class="hidden">&#9733;</div>
+    <div id="hud-pos"></div>
+    <div id="hud-title"></div>
+    <div id="hud-meta"></div>
+    <div id="hud-help">&#9660; menu &nbsp;&middot;&nbsp; Enter pause &nbsp;&middot;&nbsp; &#9664;/&#9654; seek 10s &nbsp;&middot;&nbsp; &#9650; favorite &nbsp;&middot;&nbsp; Return exit</div>
+  </div>
+
+  <div id="menu" class="hidden">
+    <div id="menu-title"></div>
+    <div id="menu-items"></div>
+    <div id="menu-help">&#9664;/&#9654; choose &nbsp;&middot;&nbsp; Enter select &nbsp;&middot;&nbsp; &#9660; close</div>
+  </div>
+
+  <div id="status-line" class="hidden"></div>
+
+  <script src="main.js"></script>
+</body>
+</html>

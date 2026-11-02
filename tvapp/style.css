@@ -1,0 +1,181 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  color: #fff;
+  font-family: "SamsungOne", Arial, sans-serif;
+  overflow: hidden;
+}
+
+#player {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: #000;
+  object-fit: contain;   /* letterbox vertical videos — never crop */
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* boot / loading screen */
+#boot-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: #101418;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+}
+
+.boot-title {
+  font-size: 8vh;
+  font-weight: bold;
+  letter-spacing: 0.3vh;
+  margin-bottom: 3vh;
+}
+
+#boot-status {
+  font-size: 3.2vh;
+  color: #9aa7b4;
+}
+
+#boot-screen.hidden { display: none !important; }
+
+/* HUD overlay */
+#hud {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 100vw;
+  box-sizing: border-box;
+  padding: 4vh 5vw 4vh 5vw;
+  background: linear-gradient(to top, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.45) 60%, rgba(0,0,0,0) 100%);
+  z-index: 20;
+}
+
+#hud-pos {
+  font-size: 2.6vh;
+  color: #8fd0ff;
+  margin-bottom: 1vh;
+}
+
+#hud-title {
+  font-size: 4.5vh;
+  font-weight: bold;
+  line-height: 1.15;
+}
+
+#hud-meta {
+  font-size: 3vh;
+  color: #cfd8e3;
+  margin-top: 0.8vh;
+}
+
+#hud-help {
+  font-size: 2.1vh;
+  color: #77828d;
+  margin-top: 2vh;
+}
+
+#hud-star {
+  position: absolute;
+  right: 5vw;
+  bottom: 12vh;
+  font-size: 8vh;
+  color: #ffd34d;
+}
+
+/* transient status (favorite saved, errors, paused) */
+#status-line {
+  position: fixed;
+  top: 4vh;
+  left: 0;
+  width: 100vw;
+  text-align: center;
+  font-size: 3.4vh;
+  color: #ffd34d;
+  text-shadow: 0 0.2vh 0.4vh rgba(0,0,0,0.9);
+  z-index: 25;
+}
+
+/* action menu overlay (Down key) */
+#menu {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100vw;
+  background: rgba(0, 0, 0, 0.82);
+  padding: 2.2vh 3vw 1.6vh 3vw;
+  z-index: 30;
+}
+#menu.hidden { display: none !important; }
+#menu-title {
+  font-size: 2.6vh;
+  color: #9ad8ff;
+  margin-bottom: 1.4vh;
+}
+#menu-items { display: flex; gap: 1.2vw; }
+.menu-item {
+  font-size: 3.2vh;
+  color: #cfd8e3;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1.2vh 2.2vw;
+  border-radius: 0.6vh;
+  border: 0.25vh solid transparent;
+}
+.menu-item.sel {
+  color: #fff;
+  border-color: #ffd34d;
+  background: rgba(255, 211, 77, 0.18);
+}
+#menu-help { font-size: 2.2vh; color: #7d8794; margin-top: 1.4vh; }
+
+/* persistent date/location line (always visible when known) */
+#meta-line {
+  position: fixed;
+  top: 2.4vh;
+  left: 2.4vw;
+  font-size: 2.6vh;
+  color: rgba(255, 255, 255, 0.82);
+  text-shadow: 0 0.2vh 0.4vh rgba(0,0,0,0.9);
+  z-index: 20;
+}
+#meta-line.hidden { display: none; }
+
+/* progress bar: thin strip along the very bottom, always visible */
+#progress {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100vw;
+  height: 0.7vh;
+  background: rgba(255, 255, 255, 0.18);
+  z-index: 15;
+}
+#progress-fill {
+  height: 100%;
+  width: 0%;
+  background: #ffd34d;
+  transition: width 0.55s linear;   /* interpolates between 500ms updates */
+}
+#progress-fill.jump { transition: none; }
+#progress-time {
+  position: absolute;
+  right: 1.2vw;
+  bottom: 1.4vh;
+  font-size: 2.4vh;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 0.2vh 0.4vh rgba(0,0,0,0.9);
+}
+#progress-time.hidden { display: none; }

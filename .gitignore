@@ -1,0 +1,8 @@
+node_modules/
+__pycache__/
+*.wgt
+deploy.local.sh
+certs/
+tvapp/.manifest.tmp
+tvapp/author-signature.xml
+tvapp/signature1.xml

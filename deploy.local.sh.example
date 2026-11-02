@@ -1,0 +1,6 @@
+# Copy to deploy.local.sh (gitignored) and fill in:
+# export FV_AUTHOR_PW='<your Tizen author cert password>'
+# export FV_TV_TOKEN='<Samsung WS API token (also in ~/.config/samsungctl.conf)>'
+# export FV_TV_HOST='<TV IP>'
+# export FV_APP_ID='<appId>.<package> as installed on the TV'
+# export FV_TVCTL=/path/to/samsungtv-cli   # optional
