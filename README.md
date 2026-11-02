@@ -1,10 +1,15 @@
 # tizen-family-videos
 
 A family-video player for 2016–2019 Samsung smart TVs (Tizen 3/4), built for a TV
-that refuses to let you sideload "properly". The TV app plays a playlist streamed
-over HTTP from a Raspberry Pi backend — with a remote-controllable queue,
-favorites, date/location overlays, and automatic handling of iPhone portrait
-videos that Tizen's video plane renders wrong.
+that refuses to let you sideload "properly". If you want to play the videos
+sitting on your Windows PC, NAS, or USB drive on your Samsung smart TV — with a
+proper playlist, remote navigation, and none of your media leaving the home
+network — this is that.
+
+The TV app plays the queue streamed over HTTP from a small backend (Raspberry Pi
+or any Linux box), with remote-controllable playlist, favorites, date/location
+overlays, and automatic handling of iPhone portrait videos that Tizen's video
+plane renders wrong.
 
 The app is deliberately simple. The interesting parts are the **[docs/](docs/)**,
 which document the undocumented: installing and signing custom web apps on a
@@ -12,11 +17,46 @@ which document the undocumented: installing and signing custom web apps on a
 quirks (mis-applied `object-fit`, rotation-metadata tiles, style-write glitches)
 we had to reverse-engineer along the way.
 
+## Where the videos live
+
+The video archive is NOT on the TV and NOT in this repo. It stays wherever you
+keep it — in our case a folder tree on a **Windows 10 desktop PC** (shared over
+SMB), but any NAS, external drive, or Linux box works the same way:
+
+```
+Windows PC / NAS                    Raspberry Pi                Samsung TV
+└─ K:\Videos  ──(SMB share)──►  /mnt/videos (read-only      ◄──HTTP──  tizen-family-videos
+   (years of phone                     CIFS mount)                      app (playlist,
+    clips, .mp4/.mov)                        │                          Range streaming,
+                                             ▼                          remote keys)
+                                     appserver/server.py
+                                     (playlist, metadata via
+                                      ffprobe, rotation-bake)
+```
+
+The Pi mounts the share **read-only** (an irreplaceable archive should be
+inaccessible to the TV stack by design), indexes it, and streams the files over
+HTTP Range requests — nothing is copied to the Pi and nothing is uploaded
+anywhere. Metadata (dates, GPS) is read with ffprobe on the mount; a
+wake-on-LAN packet keeps the Windows PC awake while a playlist is playing.
+Transcoded "bakes" for rotated files go to a small cache on the Pi.
+
+## Requirements
+
+- Samsung smart TV, Tizen 3/4 (2016–2019), Developer Mode enabled
+- Any always-on Linux box on the LAN for the backend (Pi 4 tested; needs Python 3
+  and ffmpeg)
+- Your video archive reachable from that box as a filesystem (SMB/CIFS mount,
+  NFS, local disk, ...)
+- Videos the TV can decode: h264 mp4/mov (what phones produce) works; HEVC/
+  codecs the TV itself supports will play, exotic ones won't — same limits as
+  any TV app
+
 ## Hardware this was built on
 
 - **TV**: Samsung UN50NU7100 (2018, Tizen 4.0), retail firmware, Developer Mode enabled
 - **Backend**: Raspberry Pi 4 (Debian 13), stdlib-only Python server
-- **Storage**: a read-only SMB share on a desktop PC (the video archive never leaves the LAN)
+- **Storage**: a read-only SMB share on a Windows 10 desktop PC (the video archive never leaves the LAN)
 
 ## Pieces
 
