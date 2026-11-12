@@ -6,3 +6,5 @@ certs/
 tvapp/.manifest.tmp
 tvapp/author-signature.xml
 tvapp/signature1.xml
+icon.local.*
+out/
