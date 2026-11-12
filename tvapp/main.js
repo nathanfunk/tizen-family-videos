@@ -415,10 +415,22 @@ function showHud() {
   if (!it) return;
   updateMetaLine();
   $('hud-pos').innerHTML = (g.idx + 1) + ' / ' + g.items.length;
-  $('hud-title').innerHTML = esc(it.title);
-  var meta = it.date || '';
-  if (it.location) meta += (meta ? ' \u2014 ' : '') + it.location;
-  $('hud-meta').innerHTML = esc(meta);
+  // Date is the headline; the filename drops to a small dim line below (it
+  // still matters for names like "Boat from cave", just not as the lead).
+  // Until /api/meta lands there is no date, so the filename stands in as the
+  // headline — the meta callback re-runs showHud() and swaps it over.
+  if (it.date) {
+    $('hud-title').innerHTML = esc(it.date);
+    $('hud-file').innerHTML = esc(it.title || '');
+    $('hud-file').className = it.title ? '' : 'hidden';
+    var meta = it.location || '';
+    if (it.kids) meta += (meta ? ' \u2014 ' : '') + it.kids;
+    $('hud-meta').innerHTML = esc(meta);
+  } else {
+    $('hud-title').innerHTML = esc(it.title || 'Video');
+    $('hud-file').className = 'hidden';
+    $('hud-meta').innerHTML = esc(it.location || '');
+  }
   $('hud-star').className = it.favorite ? '' : 'hidden';
   $('hud').className = '';
   if (g.hudTimer) clearTimeout(g.hudTimer);
@@ -603,9 +615,57 @@ function closeMenu() {
 
 function menuOpen() { return $('menu').className !== 'hidden'; }
 
+/* Media keys only reach the app if registered (Tizen drops unregistered hwkeys).
+   Samsung remotes send the combined play/pause button as MediaPlayPause (10252);
+   dedicated play/pause as MediaPlay (415) / MediaPause (19). registerKey fails
+   atomically if ANY name is unsupported on this TV, so ask getSupportedKeys()
+   first and register only what exists (per-key, so one bad name can't kill the
+   rest). This TV's WebKit doesn't set e.keyName, so map its real keyCodes to
+   canonical names and use that in onKeyDown. */
+function registerMediaKeys() {
+  if (!window.tizen || !tizen.tvinputdevice) return;   // dev browser
+  g.mediaByCode = {};                                  // keyCode -> canonical name
+  var wanted = { MediaPlayPause: 1, MediaPlay: 1, MediaPause: 1, MediaStop: 1,
+                 MediaRewind: 1, MediaFastForward: 1, MediaTrackPrevious: 1, MediaTrackNext: 1 };
+  try {
+    var sup = tizen.tvinputdevice.getSupportedKeys() || [];
+    var names = [], unsupported = [];
+    for (var i = 0; i < sup.length; i++) {
+      var k = sup[i];
+      var kc = (k.keyCode !== undefined) ? k.keyCode : k.code;   // Tizen 4 hides keyCode
+      if (wanted[k.name]) { names.push(k.name); if (kc !== undefined) g.mediaByCode[kc] = k.name; }
+    }
+    if (sup.length && sup[0].keyCode === undefined) {
+      tvlog('getSupportedKeys entry sample: ' + JSON.stringify(sup[0]));
+    }
+    for (var n in wanted) if (!nameIn(n, names)) unsupported.push(n);
+    for (var j = 0; j < names.length; j++) {
+      try {
+        tizen.tvinputdevice.registerKey(names[j]);
+      } catch (e2) {
+        tvlog('registerKey ' + names[j] + ' failed: ' + (e2.message || e2));
+        // drop its code from the name map so a failed key can't fire actions
+        for (var c in g.mediaByCode) if (g.mediaByCode[c] === names[j]) delete g.mediaByCode[c];
+      }
+    }
+    tvlog('media keys: supported=' + names.join(',') + ' codes=' + JSON.stringify(g.mediaByCode) +
+          (unsupported.length ? ' NOT-supported=' + unsupported.join(',') : ''));
+  } catch (e) { tvlog('getSupportedKeys failed: ' + (e.message || e)); }
+}
+function nameIn(name, list) {
+  for (var i = 0; i < list.length; i++) if (list[i] === name) return true;
+  return false;
+}
+
 function onKeyDown(e) {
   var code = e.keyCode;
-  tvlog('key ' + code);                        // learn what the remote really sends
+  var kn = e.keyName || (g.mediaByCode ? g.mediaByCode[code] : '') || '';
+  tvlog('key ' + code + (kn ? ' (' + kn + ')' : ''));  // learn what the remote really sends
+  /* media keys work whether or not the action menu is open */
+  if (kn === 'MediaPlayPause' || code === 10252 || code === 179) { togglePause(); e.preventDefault(); return; }
+  if (kn === 'MediaPlay'     || code === 415)  { if ($('player').paused) togglePause(); e.preventDefault(); return; }
+  if (kn === 'MediaPause'    || code === 19)   { if (!$('player').paused) togglePause(); e.preventDefault(); return; }
+  if (kn === 'MediaStop'     || code === 413)  { if (!$('player').paused) togglePause(); return; }
   if (menuOpen()) {
     if (code === 37) {                         // Left
       menuSel = (menuSel + MENU_ACTIONS.length - 1) % MENU_ACTIONS.length;
@@ -628,6 +688,8 @@ function onKeyDown(e) {
     case 417: next(); break;                   // FastForward = next video
     case 427: prev(); break;                   // CHUP (some maps)
     case 428: next(); break;                   // CHDOWN
+    case 10232: prev(); break;                 // MediaTrackPrevious (long-press Rewind)
+    case 10233: next(); break;                 // MediaTrackNext (long-press FastForward)
     case 13: togglePause(); break;             // Enter
     case 37: seekBy(-10); break;               // Left
     case 39: seekBy(10); break;                // Right
@@ -635,6 +697,8 @@ function onKeyDown(e) {
     case 10009: exitApp(); break;              // Return
     case 461: exitApp(); break;                // Return (older maps)
     default:
+      if (kn === 'MediaRewind' || kn === 'MediaTrackPrevious') { prev(); break; }
+      if (kn === 'MediaFastForward' || kn === 'MediaTrackNext') { next(); break; }
       if (code >= 4097 && code <= 4107) exitApp(); // color keys on some TVs
       break;
   }
@@ -765,7 +829,8 @@ if (window.addEventListener) {
   window.addEventListener('tizenhwkey', onTizenHwKey, false);
   window.addEventListener('appcontrol', onAppControl, false);   // preview tiles while running
 }
+registerMediaKeys();
 wireVideo();
 setInterval(updateProgress, 500);   // progress bar + time readout
-tvlog('boot v1.0.29 ua=' + (navigator.userAgent || '').slice(-60));
+tvlog('boot v1.0.34 ua=' + (navigator.userAgent || '').slice(-60));
 boot();

@@ -82,6 +82,12 @@ html, body {
   margin-top: 0.8vh;
 }
 
+#hud-file {
+  font-size: 2.1vh;
+  color: #77828d;
+  margin-top: 0.6vh;
+}
+
 #hud-help {
   font-size: 2.1vh;
   color: #77828d;

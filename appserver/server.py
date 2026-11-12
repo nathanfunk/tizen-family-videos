@@ -948,6 +948,37 @@ def build_playlist(qs):
     return out
 
 
+# ---- one-shot boot override -------------------------------------------------
+# /playvideos (the Hermes plugin) writes ~/.cache/fv-boot-mode.json before it
+# launches the TV app; the app's boot playlist fetch (hardcoded
+# mode=random&n=25 in the app JS) then receives the requested queue instead
+# (favorites / label / date / n). Applied exactly once, then removed.
+BOOT_OVERRIDE_PATH = os.path.expanduser("~/.cache/fv-boot-mode.json")
+BOOT_OVERRIDE_KEYS = ("mode", "label", "date", "n")
+
+
+def set_boot_override(params):
+    data = {k: str(params[k])[:200] for k in BOOT_OVERRIDE_KEYS
+            if params.get(k) not in (None, "")}
+    tmp = BOOT_OVERRIDE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, BOOT_OVERRIDE_PATH)
+
+
+def pop_boot_override():
+    try:
+        with open(BOOT_OVERRIDE_PATH) as f:
+            data = json.load(f)
+        os.unlink(BOOT_OVERRIDE_PATH)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {k: [str(data[k])] for k in BOOT_OVERRIDE_KEYS
+            if isinstance(data.get(k), str) and data[k]}
+
+
 # ---------------------------------------------------------------- HTTP
 def safe_path(rel):
     """Resolve an index-relative path, refusing anything outside MOUNT.
@@ -1098,6 +1129,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/playlist":
             ensure_mount()
+            ov = pop_boot_override()
+            if ov:
+                log("boot override applied: %r" % ov)
+                qs = ov
             try:
                 return self.send_json({"items": build_playlist(qs)})
             except Exception as e:
