@@ -36,7 +36,7 @@ grep -q "successfully installed" /tmp/fv-install.log || { echo "INSTALL FAILED";
 
 # 4. keep the Windows Desktop copy and the rpi dev copy in sync
 cp out/famvids-deploy.wgt /mnt/c/Users/natha/Desktop/famvids.wgt
-rsync -a tvapp/ rpi:~/projects/family-tv-app/tvapp/
+rsync -a tvapp/ rpi:~/projects/family-videos/tvapp/
 
 # 5. relaunch the app on the TV
 "$FV_TVCTL" --host "$FV_TV_HOST" --port 8002 --token "$FV_TV_TOKEN" app-run "$FV_APP_ID" | tail -1

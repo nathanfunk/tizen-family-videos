@@ -24,6 +24,9 @@ var g = {
   pendingNext: false,
   pendingLaunch: null,
   loadToken: 0,
+  prepareToken: 0,     // supersedes an in-flight /api/prepare when Next is pressed
+  queueQuery: '',      // effective query echoed by /api/playlist
+  lastSeekedAt: 0,     // Date.now() of the latest 'seeked' event
   lastStallLog: 0
 };
 
@@ -199,7 +202,8 @@ function loadPlaylist() {
   $('boot-status').innerHTML = 'Loading videos&hellip;';
   var t0 = Date.now();
   var token = ++g.loadToken;
-  xhrGet(g.server + '/api/playlist?mode=random&n=25', 15000, function (status, text) {
+  var query = g.queueQuery || 'mode=random&n=25';
+  xhrGet(g.server + '/api/playlist?' + query + '&boot=1', 15000, function (status, text) {
     if (token !== g.loadToken) return;   // superseded by a deep link / refresh
     if (status !== 200) {
       $('boot-status').innerHTML = 'Could not load the video list (server error ' + status + ').';
@@ -213,9 +217,10 @@ function loadPlaylist() {
       tvlog('boot: playlist empty');
       return;
     }
+    if (data.query) g.queueQuery = data.query;   // keep favorites/label/date mode
     g.items = data.items;
     g.idx = 0;
-    tvlog('boot: playlist ' + g.items.length + ' items (' + (Date.now() - t0) + 'ms)');
+    tvlog('boot: playlist ' + g.items.length + ' items (' + (Date.now() - t0) + 'ms) query=' + (g.queueQuery || '?'));
     play(0, true);
     prefetchMeta(0);   // background: warm date/location cache for the queue
   });
@@ -234,28 +239,38 @@ function play(i, fromBoot) {
   g.lastStallLog = 0;
   lastPct = -1;
   if (g.skipTimer) { clearTimeout(g.skipTimer); g.skipTimer = null; }
-  if (g.watchdog) clearTimeout(g.watchdog);
-  // Watchdog: if the media element never starts, report it server-side
-  g.watchdog = setTimeout(function () {
-    if (!g.playSeen) {
-      tvlog('watchdog: no playing event src=' + (v.currentSrc || v.src) +
-            ' err=' + (v.error ? v.error.code : 'null') +
-            ' readyState=' + v.readyState + ' networkState=' + v.networkState);
-      status('Video did not start (err ' + (v.error ? v.error.code : 'none') + ') — menu via \u25BC for options', 8000);
-    }
-  }, 25000);
+  if (g.watchdog) { clearTimeout(g.watchdog); g.watchdog = null; }
   var url = g.server + '/api/video?p=' + encodeURIComponent(it.path);
   tvlog('play ' + (i + 1) + '/' + g.items.length + ' ' + it.path);
   // Size the plane BEFORE the video loads when the server already knows the
   // display size — avoids style writes while playback is starting.
   fitPlayer();
-  v.src = url;
-  try { v.play(); } catch (e) { tvlog('play() threw ' + e); }
   showHud();
   updateMetaLine();
-  status('Playing ' + (i + 1) + ' of ' + g.items.length, 3000);
-  if (fromBoot) {
-    $('boot-screen').className = 'hidden';
+  // Ask the server to kick/wait for the rotation bake BEFORE assigning src.
+  // The old path assigned src immediately and let each Range request wait 12s,
+  // which was shorter than a real bake (~2.3x realtime).
+  var seq = ++g.prepareToken;
+  if (it.prepared) {
+    startPlayback(i, it, url, fromBoot);
+  } else {
+    if (fromBoot) $('boot-status').innerHTML = 'Preparing video&hellip;';
+    else status('Preparing video\u2026', 95000);
+    var t0 = Date.now();
+    xhrGet(g.server + '/api/prepare?p=' + encodeURIComponent(it.path), 110000, function (st, text) {
+      if (seq !== g.prepareToken) return;   // Next/previous superseded this
+      var r = null;
+      try { r = JSON.parse(text); } catch (e) { r = null; }
+      if (st === 200 && r && r.ready) {
+        it.prepared = true;
+        tvlog('prepare ready ' + it.path + ' baked=' + (r.baked ? 1 : 0) +
+              ' (' + (Date.now() - t0) + 'ms)');
+      } else {
+        tvlog('prepare not ready status=' + st + ' ' + it.path +
+              ' (' + (Date.now() - t0) + 'ms)');
+      }
+      startPlayback(i, it, url, fromBoot);
+    });
   }
   // Date/location metadata: compute on demand (cached server-side), update HUD
   // when it arrives so playback never waits on it.
@@ -275,6 +290,27 @@ function play(i, fromBoot) {
       it.disp_h = m.disp_h || it.disp_h || 0;
       if (g.idx === i) { showHud(); updateMetaLine(); fitPlayer(); }
     });
+  }
+}
+
+function startPlayback(i, it, url, fromBoot) {
+  var v = $('player');
+  // Watchdog starts after preparation: a 90s bake must not look like a stall.
+  g.watchdog = setTimeout(function () {
+    if (!g.playSeen) {
+      tvlog('watchdog: no playing event src=' + (v.currentSrc || v.src) +
+            ' err=' + (v.error ? v.error.code : 'null') +
+            ' readyState=' + v.readyState + ' networkState=' + v.networkState);
+      status('Video did not start (err ' + (v.error ? v.error.code : 'none') + ') — menu via \u25BC for options', 8000);
+    }
+  }, 25000);
+  v.src = url;
+  try { v.play(); } catch (e) { tvlog('play() threw ' + e); }
+  showHud();
+  updateMetaLine();
+  status('Playing ' + (i + 1) + ' of ' + g.items.length, 3000);
+  if (fromBoot) {
+    $('boot-screen').className = 'hidden';
   }
 }
 
@@ -307,7 +343,8 @@ function extendQueue() {
   extending = true;
   var t0 = Date.now();
   var token = ++g.loadToken;
-  xhrGet(g.server + '/api/playlist?mode=random&n=25', 15000, function (st, text) {
+  var query = g.queueQuery || 'mode=random&n=25';
+  xhrGet(g.server + '/api/playlist?' + query, 15000, function (st, text) {
     if (token !== g.loadToken) return;   // superseded by a deep link / refresh
     extending = false;
     if (st !== 200 || !text) {
@@ -326,6 +363,7 @@ function extendQueue() {
       }
       return;
     }
+    if (data.query) g.queueQuery = data.query;
     var seen = {};
     for (var i = 0; i < g.items.length; i++) seen[g.items[i].path] = 1;
     var added = 0;
@@ -347,13 +385,15 @@ function extendQueue() {
 function refreshQueue() {
   extending = true;
   var token = ++g.loadToken;
-  xhrGet(g.server + '/api/playlist?mode=random&n=25', 15000, function (st, text) {
+  var query = g.queueQuery || 'mode=random&n=25';
+  xhrGet(g.server + '/api/playlist?' + query, 15000, function (st, text) {
     if (token !== g.loadToken) return;   // superseded by a deep link / newer fetch
     extending = false;
     if (st !== 200 || !text) { status('Could not load more videos', 4000); return; }
     var data = null;
     try { data = JSON.parse(text); } catch (e) { data = null; }
     if (!data || !data.items || !data.items.length) { status('Could not load more videos', 4000); return; }
+    if (data.query) g.queueQuery = data.query;
     g.items = data.items;
     g.idx = -1;
     tvlog('queue refreshed with ' + g.items.length + ' fresh items');
@@ -468,15 +508,18 @@ function toggleFavorite() {
 /* ---------------------------------------------------------------- keys */
 /* Tizen 4.0 quirk: setting currentTime updates the property but the engine may
    ignore the actual stream seek (it never requests the target byte range and
-   playback keeps its own position — ct reads back EXACTLY the set value).
-   seekBy tries three strategies in order, logging each result:
+   playback keeps its own position). seekBy tries three strategies in order,
+   logging each result:
      A. plain currentTime set (works on some files)
      B. pause -> seek -> resume
      C. media-fragment restart: re-open the stream at #t=<seconds>
-   "ignored" is detected by time: after a real seek, ct advances (~+1s); if ct
-   still reads exactly the target after 900ms, the engine didn't move. */
-function seekIsStuck(v, t) {
-  return Math.abs(v.currentTime - t) < 0.15;   // frozen exactly at target
+   Success is a 'seeked' event or currentTime moving away from where it was
+   before the attempt — NOT whether it equals the requested target (a correct
+   seek lands exactly on the target, which the old check called "STUCK"). */
+function seekMoved(v, from, startedAt) {
+  if (g.lastSeekedAt && g.lastSeekedAt >= startedAt) return true;
+  // An ignored seek while playing only drifts forward ~0.9s by the check.
+  return Math.abs(v.currentTime - from) > 1.5;
 }
 
 function seekBy(sec) {
@@ -509,14 +552,17 @@ function seekBy(sec) {
   function attemptB() {
     tvlog('seek B: pause-seek-resume');
     try { v.pause(); } catch (e) {}
+    var fromB = v.currentTime;
+    var startB = Date.now();
     try { v.currentTime = t; } catch (e1) {}
     setTimeout(function () {
       try { if (wasPlaying) v.play(); } catch (e2) {}
       setTimeout(function () {
+        var moved = seekMoved(v, fromB, startB);
         tvlog('seek B result ct=' + v.currentTime.toFixed(1) +
-              (seekIsStuck(v, t) ? ' STUCK' : ' moved'));
-        if (seekIsStuck(v, t)) attemptC();
-        else finish(true);
+              (moved ? ' moved' : ' STUCK'));
+        if (moved) finish(true);
+        else attemptC();
       }, 900);
     }, 500);
   }
@@ -538,13 +584,14 @@ function seekBy(sec) {
   }
 
   // Attempt A
+  var startA = Date.now();
   try { v.currentTime = t; } catch (err) {
     tvlog('seek A threw ' + err);
     attemptB();
     return;
   }
   setTimeout(function () {
-    var moved = !seekIsStuck(v, t);
+    var moved = seekMoved(v, from, startA);
     tvlog('seek A result ct=' + v.currentTime.toFixed(1) + (moved ? ' moved' : ' STUCK'));
     if (moved) finish(true);
     else if (wasPlaying) attemptB();
@@ -819,6 +866,7 @@ function wireVideo() {
     tvlog('seeking -> ' + (v.currentTime || 0).toFixed(1));
   });
   v.addEventListener('seeked', function () {
+    g.lastSeekedAt = Date.now();
     tvlog('seeked -> ' + (v.currentTime || 0).toFixed(1));
   });
 }
@@ -832,5 +880,5 @@ if (window.addEventListener) {
 registerMediaKeys();
 wireVideo();
 setInterval(updateProgress, 500);   // progress bar + time readout
-tvlog('boot v1.0.34 ua=' + (navigator.userAgent || '').slice(-60));
+tvlog('boot v1.0.35 ua=' + (navigator.userAgent || '').slice(-60));
 boot();

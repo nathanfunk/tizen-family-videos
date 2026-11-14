@@ -8,7 +8,8 @@ videos are being served.
 
 Endpoints (all CORS-enabled — the TV widget calls these cross-origin):
   GET  /api/health
-  GET  /api/playlist?mode=random&n=25            (also: mode=favorites | label=<lbl> | date=<prefix>)
+  GET  /api/playlist?mode=random&n=25&boot=1     (also: mode=favorites | label=<lbl> | date=<prefix>)
+  GET  /api/prepare?p=<index-relative-path>      wait for rotation bake (≤90s)
   GET  /api/video?p=<index-relative-path>        HTTP Range stream
   GET  /api/meta?p=<path>                        date/location/duration/display size
   GET  /api/favorites                            list
@@ -32,16 +33,27 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 MOUNT = os.environ.get("FV_MOUNT", "/mnt/family-media")
 INDEX = os.environ.get("FV_INDEX", os.path.expanduser("~/projects/family-videos/index.txt"))
 FAV = os.environ.get("FV_FAVORITES", os.path.expanduser("~/projects/family-videos/favorites.tsv"))
+# Weekly index refresh from the HP (ported from cast-random.sh). Disable with
+# FV_INDEX_REFRESH=0; FV_INDEX_SCP can point at a fake scp for offline tests.
+INDEX_MAX_AGE = int(os.environ.get("FV_INDEX_MAX_AGE", str(7 * 24 * 3600)))
+INDEX_REFRESH_ENABLED = os.environ.get("FV_INDEX_REFRESH", "1") not in ("0", "false", "no")
+INDEX_SCP = os.environ.get("FV_INDEX_SCP", "scp")
+INDEX_HOST = os.environ.get("FV_INDEX_HOST", "hp-pavillion")
+INDEX_USER = os.environ.get("FV_INDEX_USER", "natha")
+INDEX_KEY = os.environ.get("FV_INDEX_KEY", os.path.expanduser("~/.ssh/family_videos_ed25519"))
+INDEX_REMOTE = os.environ.get("FV_INDEX_REMOTE", "C:/Users/natha/family-videos-index.txt")
+INDEX_CHECK_SECONDS = int(os.environ.get("FV_INDEX_CHECK_SECONDS", "3600"))
 GEO_PY = os.path.expanduser("~/projects/family-videos/geo-venv/bin/python")
 CACHE = os.path.expanduser("~/.cache/family-videos-meta.json")
 BAKE_DIR = os.path.expanduser("~/.cache/family-videos-bake")
 BAKE_CAP_BYTES = 2 * 1024 * 1024 * 1024   # LRU cap for baked files
 BAKE_RETRY_SECONDS = 300                  # back off after a failed bake
+PREPARE_WAIT_SECONDS = int(os.environ.get("FV_PREPARE_WAIT", "90"))  # max /api/prepare wait
 APP_DIR = os.environ.get("FV_APP_DIR", "")  # set in dev to serve the tvapp dir
 PORT = int(os.environ.get("FV_PORT", "8123"))
 MAX_BODY = 64 * 1024                      # POST bodies are tiny JSON documents
@@ -63,6 +75,8 @@ def _load_placeholder():
 PLACEHOLDER_JPEG = _load_placeholder()
 
 LOG = os.environ.get("FV_LOG", "/tmp/family-videos-app.log")
+LOG_MAX_BYTES = int(os.environ.get("FV_LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+LOG_BACKUPS = int(os.environ.get("FV_LOG_BACKUPS", "1"))   # LOG + LOG.1 = 2 files
 # WOL target MAC (env override; empty disables WOL)
 HP_MAC = os.environ.get("FV_HP_MAC", "")
 
@@ -72,15 +86,37 @@ _meta_dirty = False
 
 _last_video_hit = 0.0
 
+_log_lock = threading.Lock()
+
+
+def _rotate_log():
+    """Size-cap the app log: LOG -> LOG.1 (oldest backup dropped)."""
+    try:
+        if not os.path.isfile(LOG) or os.path.getsize(LOG) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for i in range(LOG_BACKUPS, 0, -1):
+            src = LOG if i == 1 else "%s.%d" % (LOG, i - 1)
+            dst = "%s.%d" % (LOG, i)
+            if os.path.exists(src):
+                os.replace(src, dst)
+    except OSError:
+        pass
+
 
 def log(msg):
     # keep every entry on one line: some messages include request/client data
     msg = str(msg).replace("\r", "\\r").replace("\n", "\\n")
-    try:
-        with open(LOG, "a") as f:
-            f.write("%s fv-app: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg))
-    except OSError:
-        pass
+    line = "%s fv-app: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg)
+    with _log_lock:
+        _rotate_log()
+        try:
+            with open(LOG, "a") as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- HP wake
@@ -457,6 +493,51 @@ def needs_bake(rel):
         return False
 
 
+def prepare_video(rel):
+    """Kick/wait for a rotation bake before the TV assigns the video src.
+
+    Returns {ok, ready, baked, waited, error?}. ready=False means the caller
+    may still fall back to the original stream (never hang the queue)."""
+    t0 = time.time()
+    real = safe_path(rel)
+    if real is None:
+        return {"ok": False, "ready": False, "baked": False,
+                "error": "not found"}
+    try:
+        if not needs_bake(rel):
+            return {"ok": True, "ready": True, "baked": False,
+                    "waited": round(time.time() - t0, 1)}
+        out = _bake_ready(rel)
+        if out:
+            _touch(out)
+            return {"ok": True, "ready": True, "baked": True,
+                    "waited": round(time.time() - t0, 1)}
+        if not _bake_blocked(rel):
+            threading.Thread(target=bake_video, args=(rel,), daemon=True).start()
+            log("prepare: baking %s" % rel)
+        deadline = t0 + PREPARE_WAIT_SECONDS
+        failed = False
+        while time.time() < deadline:
+            out = _bake_ready(rel)
+            if out:
+                _touch(out)
+                return {"ok": True, "ready": True, "baked": True,
+                        "waited": round(time.time() - t0, 1)}
+            # Thread ended without producing output (recent failure): stop.
+            if not _bake_is_active(rel) and _bake_blocked(rel):
+                failed = True
+                break
+            time.sleep(0.5)
+        log(("prepare: bake unavailable: %s" if failed else "prepare timed out: %s") % rel)
+        return {"ok": True, "ready": False, "baked": False,
+                "waited": round(time.time() - t0, 1),
+                "error": "bake not ready"}
+    except Exception as e:
+        log("prepare error %r: %s" % (e, rel))
+        return {"ok": False, "ready": False, "baked": False,
+                "waited": round(time.time() - t0, 1), "error": str(e)}
+
+
 def pretty_date(rel, created, mtime_fallback=True):
     base = os.path.basename(rel)
     d = os.path.dirname(rel)
@@ -477,6 +558,14 @@ def pretty_date(rel, created, mtime_fallback=True):
             except ValueError:
                 pass
         return "%d" % int(m3.group(1))
+    # Embedded creation_time is the real filming date (iCloud exports have a
+    # download-date mtime months/years later), so prefer it over the mtime.
+    if created:
+        try:
+            t = time.strptime(created[:10], "%Y-%m-%d")
+            return fmt_date(t.tm_year, t.tm_mon, t.tm_mday)
+        except ValueError:
+            pass
     if mtime_fallback:
         try:
             st = os.stat(os.path.join(MOUNT, rel))
@@ -484,12 +573,6 @@ def pretty_date(rel, created, mtime_fallback=True):
             return fmt_date(t.tm_year, t.tm_mon, t.tm_mday)
         except OSError:
             pass
-        if created:
-            try:
-                t = time.strptime(created[:10], "%Y-%m-%d")
-                return fmt_date(t.tm_year, t.tm_mon, t.tm_mday)
-            except ValueError:
-                pass
     return ""
 
 
@@ -637,6 +720,95 @@ def read_index():
         return [l.decode("utf-8", "replace").strip() for l in data.replace(b"\r\n", b"\n").split(b"\n") if l.strip()]
     except OSError:
         return []
+
+
+# ------------------------------------------------------------ index refresh
+_index_refresh_lock = threading.Lock()
+_index_refreshing = False
+_index_last_error = ""
+
+
+def index_age():
+    try:
+        return max(0, int(time.time() - os.path.getmtime(INDEX)))
+    except OSError:
+        return None
+
+
+def index_fresh():
+    age = index_age()
+    try:
+        size = os.path.getsize(INDEX)
+    except OSError:
+        size = 0
+    return age is not None and size > 0 and age < INDEX_MAX_AGE
+
+
+def index_status():
+    with _index_refresh_lock:
+        refreshing = _index_refreshing
+        last_error = _index_last_error
+    return {"age_s": index_age(), "entries": len(read_index()),
+            "stale": not index_fresh(), "refreshing": refreshing,
+            "last_error": last_error}
+
+
+def refresh_index():
+    """Fetch the index over SSH, strip BOM/CRLF, then atomically replace it."""
+    global _index_refreshing, _index_last_error
+    if not INDEX_REFRESH_ENABLED:
+        return False
+    with _index_refresh_lock:
+        if _index_refreshing:
+            return False
+        _index_refreshing = True
+    tmp = INDEX + ".tmp"
+    try:
+        wol()   # HP may be asleep; a cheap wake attempt before scp
+        cmd = [INDEX_SCP, "-q", "-i", INDEX_KEY, "-o", "BatchMode=yes",
+               "%s@%s:%s" % (INDEX_USER, INDEX_HOST, INDEX_REMOTE), tmp]
+        proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace")[-300:].strip()
+            raise OSError("scp rc=%d %s" % (proc.returncode, err))
+        with open(tmp, "rb") as f:
+            data = f.read()
+        if data[:3] == b"\xef\xbb\xbf":
+            data = data[3:]
+        data = data.replace(b"\r\n", b"\n")
+        if not data.strip():
+            raise OSError("downloaded index is empty")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, INDEX)
+        with _index_refresh_lock:
+            _index_last_error = ""
+        log("index refreshed: %d entries" % len(read_index()))
+        return True
+    except Exception as e:
+        with _index_refresh_lock:
+            _index_last_error = str(e)
+        log("index refresh failed: %r" % e)
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        with _index_refresh_lock:
+            _index_refreshing = False
+
+
+def index_refresh_loop():
+    """Refresh once at startup when stale, then re-check hourly."""
+    while True:
+        try:
+            if not index_fresh():
+                log("index stale/missing -> refreshing")
+                refresh_index()
+        except Exception as e:
+            log("index refresh loop error: %r" % e)
+        time.sleep(INDEX_CHECK_SECONDS)
 
 
 def read_favorites():
@@ -892,17 +1064,31 @@ def write_favorite(action, path, label, note):
     return True, "ok"
 
 
-def build_playlist(qs):
+def queue_params(qs):
+    """Normalized queue query, echoed to the app so extension keeps the mode."""
     mode = (qs.get("mode", ["random"])[0] or "random").lower()
-    entries = read_index()
-    picks = []
-    label = qs.get("label", [""])[0]
-    arg = qs.get("arg", [""])[0]
-    date = qs.get("date", [""])[0]
     try:
         n = max(1, min(200, int(qs.get("n", ["25"])[0])))
     except (ValueError, TypeError):
         n = 25
+    params = {"mode": mode, "n": n}
+    for key in ("label", "date", "arg"):
+        value = qs.get(key, [""])[0]
+        if value:
+            params[key] = value
+    return params
+
+
+def build_playlist(qs, params=None):
+    if params is None:
+        params = queue_params(qs)
+    mode = params["mode"]
+    n = params["n"]
+    label = params.get("label", "")
+    arg = params.get("arg", "")
+    date = params.get("date", "")
+    entries = read_index()
+    picks = []
 
     favs = read_favorites()
     fav_paths = set(p for _, p, _ in favs)
@@ -1099,7 +1285,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
             return
         if parsed.path == "/api/video":
-            real = safe_path(qs.get("p", [""])[0])
+            rel = qs.get("p", [""])[0]
+            real = safe_path(rel)
             if real is None:
                 try:
                     self.send_response(404)
@@ -1109,6 +1296,12 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     self.close_connection = True
                 return
+            # Match GET when a baked copy already exists, but never probe or
+            # start a bake from a HEAD request.
+            baked = _bake_ready(rel) if rel else None
+            if baked:
+                _touch(baked)
+                real = baked
             return self._video_response(real, head_only=True)
         try:
             self.send_response(404)
@@ -1125,19 +1318,32 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/api/health":
-            return self.send_json({"ok": True, "mount": mount_ok()})
+            return self.send_json({"ok": True, "mount": mount_ok(),
+                                   "index": index_status()})
 
         if path == "/api/playlist":
             ensure_mount()
-            ov = pop_boot_override()
+            # Only the app's initial boot fetch may consume the override; a
+            # mid-session extension/refresh must not be hijacked by a stale one.
+            boot = qs.get("boot", ["0"])[0] == "1"
+            ov = pop_boot_override() if boot else None
             if ov:
                 log("boot override applied: %r" % ov)
                 qs = ov
+            params = queue_params(qs)
             try:
-                return self.send_json({"items": build_playlist(qs)})
+                items = build_playlist(qs, params)
+                return self.send_json({"items": items,
+                                       "query": urlencode(params)})
             except Exception as e:
                 log("playlist error: %r" % e)
                 return self.send_json({"error": str(e)}, 500)
+
+        if path == "/api/prepare":
+            ensure_mount()
+            rel = qs.get("p", [""])[0]
+            res = prepare_video(rel)
+            return self.send_json(res, 200 if res.get("ok") else 404)
 
         if path == "/api/meta":
             ensure_mount()
@@ -1207,6 +1413,8 @@ class Handler(BaseHTTPRequestHandler):
             wol()  # cheap; keeps HP awake while the family watches
             # Rotation-baked playback: rotated iPhone files render as a tile on
             # the TV plane — serve the baked (portrait-pixel) copy when ready.
+            # The app calls /api/prepare first, so never block a Range request
+            # waiting for a bake here (three parallel ranges each waited 12s).
             use = real
             try:
                 if needs_bake(rel):
@@ -1214,16 +1422,6 @@ class Handler(BaseHTTPRequestHandler):
                     if out:
                         use = out
                         _touch(out)
-                    elif _bake_is_active(rel):
-                        for _ in range(24):        # warmed by prefetch: wait ≤12s
-                            time.sleep(0.5)
-                            out = _bake_ready(rel)
-                            if out:
-                                use = out
-                                _touch(out)
-                                break
-                        else:
-                            log("bake wait timed out: %s" % rel)
                     elif not _bake_blocked(rel):
                         threading.Thread(target=bake_video, args=(rel,),
                                          daemon=True).start()
@@ -1389,6 +1587,7 @@ def main():
     load_meta()
     threading.Thread(target=keepalive_loop, daemon=True).start()
     threading.Thread(target=warm_previews, daemon=True).start()
+    threading.Thread(target=index_refresh_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log("listening on :%d (app dir: %s)" % (PORT, APP_DIR or "-"))
     srv.serve_forever()
